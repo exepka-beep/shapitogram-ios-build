@@ -1,0 +1,454 @@
+name: Build ShapitoGram Unsigned IPA
+
+# Builds an unsigned iOS .ipa of the ShapitoGram client from upstream Telegram-iOS.
+# The output is intentionally unsigned: it is meant to be signed at install time
+# with a free Apple ID via Sideloadly / AltStore / 3uTools.
+#
+# Why this repository contains only patches instead of a full fork: upstream
+# Telegram-iOS is a Bazel project of tens of thousands of files. Keeping just the
+# diff means every upstream change is a one-line bump here, and the checkout stays
+# reproducible because UPSTREAM_REF pins the exact commit the patch was written for.
+
+on:
+  # Manual only on purpose: a single run costs 60-90 runner minutes, so it must
+  # never start as a side effect of pushing a commit.
+  workflow_dispatch:
+
+jobs:
+  build:
+    # macos-latest is macOS 26 arm64, which matches "macos": "26" in the pinned
+    # upstream versions.json. Its default Xcode (26.6) shares a major version with
+    # the declared 26.2, so the Xcode selection step keeps the image default and
+    # Bazel's resolved SDK stays in sync with xcrun inside the actions.
+    #
+    # Do not pin this back to macos-15: that image's default Xcode is 16.4, whose
+    # Swift rejects the TARGET_OS_* macros this codebase used back then, while its
+    # Xcode 16.2 disagrees with xcrun about the iOS SDK version. The current
+    # upstream compiles cleanly against the current toolchain.
+    runs-on: macos-latest
+    timeout-minutes: 720
+    env:
+      # Pinned upstream commit (Telegram 12.9.2). The patch in patches/ is written
+      # against exactly this revision; bump both together or the apply step refuses
+      # to run. Verified locally: applies with no fuzz and no offsets.
+      UPSTREAM_REF: 6ad963e5b62d354da79040f388ae2b9132fb17b8
+
+      # ShapitoGram branding, applied to the built product.
+      CUSTOM_APP_NAME: ShapitoGram
+      CUSTOM_BUNDLE_ID: com.shapitogram.messenger
+      CUSTOM_URL_SCHEME: shapitogram
+
+      # Наш MTProto-сервер: seed-адрес, к которому клиент идёт при первом старте.
+      # Применяется скриптом scripts/apply_server.py поверх патча — правка кода
+      # не нужна.
+      #
+      # Домен стоит первым, голый IP — вторым. В Telegram seedAddressList это
+      # список, и MtProtoKit перебирает его целиком (discoverSchemeWithContext:
+      # строит по пробнику на каждый адрес), так что это настоящий fallback, а не
+      # украшение: домен переживает смену IP у хостера, а IP выручает, если у
+      # пользователя не резолвится DNS. Потерять bootstrap-адрес нельзя — без
+      # него клиент не доживёт до help.getConfig, где сервер отдаёт свой список.
+      CUSTOM_HOST: shapitogram.xyz
+      CUSTOM_HOST_ALT: 94.156.170.106
+      CUSTOM_PORT: "2398"
+
+      # Публичный ключ MTProto-сервера. Если задан SERVER_INFO_URL, ключ
+      # скачивается прямо во время сборки из /owpengram/server-info — это
+      # предпочтительный путь: при TELESRV_RSA_IDENTITY_MODE=generated сервер
+      # создаёт ключ сам при первом старте, и заранее его никто не знает.
+      #
+      # Проверено 09.10.2026: эндпоинт отвечает 200, а fingerprint, который
+      # считает scripts/fetch_server_key.py (0x1466b1b3af48f70b), совпадает с
+      # rsa_fingerprint из логов сервера (1470057713681102603) — то есть вшивается
+      # ровно тот ключ, которым сервер отвечает в resPQ.
+      #
+      # Пусто -> берётся файл config/server-rsa-public.pem (его надо положить
+      # руками: ssh root@<ip> 'docker exec <server> cat /var/lib/telesrv/server_rsa.pem'
+      # | openssl rsa -pubout).
+      SERVER_INFO_URL: "https://shapitogram.xyz/owpengram/server-info"
+
+      # Locales kept in the shipped IPA. Russian is required for the target users.
+      IPA_KEEP_LOCALES: Base,en,ru
+
+      # Extensions removed to keep the unsigned IPA small enough to sideload.
+      #
+      # Notification/Intents are dropped as well: every extension needs its own
+      # provisioning profile, and a free Apple ID can neither grant the App Group
+      # they all read from nor provision that many App IDs. Leaving them in makes
+      # Sideloadly fail, and ShapitoGram does not use them anyway.
+      IPA_DROP_PLUGINS: Watch,Widget,BroadcastUpload,Share,Notification,Intents
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Restore Bazel disk cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/bazel-disk-cache
+          # Keyed on the pinned upstream ref, not on github.sha: every run builds
+          # the very same source, so a per-commit key would never restore anything.
+          key: bazel-disk-cache-${{ runner.os }}-${{ env.UPSTREAM_REF }}-v1
+          restore-keys: |
+            bazel-disk-cache-${{ runner.os }}-${{ env.UPSTREAM_REF }}-
+
+      - name: Clone upstream Telegram iOS
+        run: |
+          set -euxo pipefail
+          git clone -j8 --filter=blob:none https://github.com/TelegramMessenger/Telegram-iOS.git "$RUNNER_TEMP/telegram-ios"
+          git -C "$RUNNER_TEMP/telegram-ios" checkout "$UPSTREAM_REF"
+          git -C "$RUNNER_TEMP/telegram-ios" submodule sync --recursive
+          git -C "$RUNNER_TEMP/telegram-ios" submodule update --init --recursive --jobs 8
+
+      - name: Apply ShapitoGram patch
+        run: |
+          set -euxo pipefail
+          # Invoked through bash on purpose: files added over the GitHub contents
+          # API land as mode 100644, so the shebang alone is not enough.
+          bash "$GITHUB_WORKSPACE/scripts/apply_mods.sh" "$RUNNER_TEMP/telegram-ios"
+
+      - name: Point the client at our server
+        run: |
+          set -euxo pipefail
+          # Seed address is baked into Network.swift by the branding patch, but the
+          # host/port differ per deployment. Keep them out of the patch so a new
+          # server needs no code edit — just set CUSTOM_HOST / CUSTOM_HOST_ALT /
+          # CUSTOM_PORT. The script validates all three, so a typo fails here
+          # instead of 60 runner-minutes later inside Bazel.
+          CUSTOM_HOST="$CUSTOM_HOST" \
+          CUSTOM_HOST_ALT="$CUSTOM_HOST_ALT" \
+          CUSTOM_PORT="$CUSTOM_PORT" \
+            python3 "$GITHUB_WORKSPACE/scripts/apply_server.py" "$RUNNER_TEMP/telegram-ios"
+
+      - name: Refresh the server RSA public key from the running server
+        if: ${{ env.SERVER_INFO_URL != '' }}
+        run: |
+          set -euxo pipefail
+          # The server generates its own RSA identity on first start
+          # (TELESRV_RSA_IDENTITY_MODE=generated), so the key cannot be committed
+          # to this repository. Pull it from the public server-info endpoint
+          # instead; the PEM that lands here is what gets compiled into the app.
+          python3 "$GITHUB_WORKSPACE/scripts/fetch_server_key.py" \
+            --url "$SERVER_INFO_URL" \
+            --out "$GITHUB_WORKSPACE/config/server-rsa-public.pem"
+
+      - name: Bake in the server RSA public key
+        run: |
+          set -euxo pipefail
+          # The MTProto handshake only completes when the client knows a public
+          # key whose fingerprint our server advertises in resPQ. The two stock
+          # Telegram keys in MtProtoKit can never match a self-hosted telesrv, so
+          # selectPublicKey() returns nil, req_DH_params is never sent and the
+          # app stays on the launch screen forever (black in dark mode). This
+          # rewrites both entries of defaultPublicKeys() with our own key.
+          #
+          # If the server RSA identity is ever regenerated (mode "generated", or
+          # the key file deleted), refresh config/server-rsa-public.pem and
+          # rebuild — otherwise no client can authenticate any more.
+          KEY_FILE="$GITHUB_WORKSPACE/config/server-rsa-public.pem"
+          # Fail with one readable line instead of "no base64 payload found":
+          # an unsigned build with a placeholder key boots into a black splash
+          # screen, which is far harder to diagnose than a red X here.
+          if ! grep -q '^-----BEGIN .*PUBLIC KEY-----$' "$KEY_FILE"; then
+            echo "config/server-rsa-public.pem is still the placeholder." >&2
+            echo "Set SERVER_INFO_URL to https://<домен>/owpengram/server-info," >&2
+            echo "or paste the real public key into the file." >&2
+            exit 1
+          fi
+          python3 "$GITHUB_WORKSPACE/scripts/apply_rsa_key.py" \
+            "$RUNNER_TEMP/telegram-ios" \
+            "$KEY_FILE"
+
+      - name: Set active Xcode version
+        run: |
+          set -euxo pipefail
+          SOURCE_DIR="$RUNNER_TEMP/telegram-ios"
+          XCODE_VERSION=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["xcode"])' "$SOURCE_DIR/versions.json")
+          XCODE_MAJOR="${XCODE_VERSION%%.*}"
+          DEFAULT_XCODE="/Applications/Xcode.app/Contents/Developer"
+          DEFAULT_VERSION=""
+          if [[ -d "$DEFAULT_XCODE" ]]; then
+            DEFAULT_VERSION="$("$DEFAULT_XCODE/usr/bin/xcodebuild" -version 2>/dev/null | awk '/^Xcode/{print $2}')"
+          fi
+          echo "versions.json wants Xcode $XCODE_VERSION (major $XCODE_MAJOR); image default is ${DEFAULT_VERSION:-none}"
+          ls -d /Applications/Xcode*.app || true
+
+          SELECTED_DEVELOPER=""
+
+          # Prefer the image default as long as its major version matches the one
+          # upstream declares. Picking a different *minor* is what broke the build:
+          # Bazel configured its toolchain from the selected 16.2 (SDK 18.2) while
+          # xcrun inside the action resolved the default 16.4 (SDK 18.5), so ibtool
+          # reported "iOS 18.2 Platform Not Installed". The image ships the default
+          # Xcode completely, so let both sides agree on it.
+          if [[ -n "$DEFAULT_VERSION" && "${DEFAULT_VERSION%%.*}" == "$XCODE_MAJOR" ]]; then
+            SELECTED_DEVELOPER="$DEFAULT_XCODE"
+          fi
+
+          if [[ -z "$SELECTED_DEVELOPER" && -d "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer/Platforms/iPhoneOS.platform" ]]; then
+            SELECTED_DEVELOPER="/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+          fi
+
+          if [[ -z "$SELECTED_DEVELOPER" ]]; then
+            for candidate in /Applications/Xcode_${XCODE_MAJOR}.*.app/Contents/Developer; do
+              if [[ -d "$candidate/Platforms/iPhoneOS.platform" ]]; then
+                SELECTED_DEVELOPER="$candidate"
+              fi
+            done
+          fi
+
+          if [[ -z "$SELECTED_DEVELOPER" ]]; then
+            echo "No installed Xcode has a usable iOS platform" >&2
+            exit 1
+          fi
+
+          echo "Using Xcode developer dir: $SELECTED_DEVELOPER"
+          sudo xcode-select -s "$SELECTED_DEVELOPER"
+          xcodebuild -version
+          echo "--- iphoneos SDK in use ---"
+          xcrun --sdk iphoneos --show-sdk-version || true
+          xcrun --sdk iphoneos --show-sdk-path || true
+
+      - name: Free disk space
+        run: |
+          set -euxo pipefail
+          echo "--- before ---"
+          df -h /
+          # Only caches are dropped. Simulator runtimes are deliberately left
+          # alone: removing them measured as freeing nothing on this image while
+          # risking a missing iOS platform for ibtool.
+          sudo rm -rf ~/Library/Developer/Xcode/DerivedData || true
+          rm -rf ~/.cache/* || true
+          echo "--- after ---"
+          df -h /
+
+      - name: Build unsigned IPA
+        env:
+          BAZEL_USER_ROOT: /private/var/tmp/_bazel_containerhost
+        run: |
+          set -euxo pipefail
+          SOURCE_DIR="$RUNNER_TEMP/telegram-ios"
+          cd "$SOURCE_DIR"
+
+          BUILD_NUMBER_OFFSET="$(cat "$SOURCE_DIR/build_number_offset")"
+          APP_VERSION="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["app"])' "$SOURCE_DIR/versions.json")"
+          COMMIT_COUNT="$(git -C "$SOURCE_DIR" rev-list --count HEAD)"
+          # Upstream derives CFBundleVersion purely from the commit count, so every
+          # build of the same pinned revision reports the same number (34474 for the
+          # current pin) and two of our builds cannot be told apart on the device.
+          # Shift it into our own range so each iteration is identifiable in
+          # Settings -> General -> iPhone Storage.
+          SHAPITOGRAM_BUILD_BASE=800000
+          BUILD_NUMBER="$((SHAPITOGRAM_BUILD_BASE + COMMIT_COUNT + BUILD_NUMBER_OFFSET))"
+          BAZEL_CACHE_DIR="$RUNNER_TEMP/bazel-disk-cache"
+          mkdir -p "$BAZEL_CACHE_DIR"
+
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+
+          # The bundled fake-codesigning profiles expire over time. Refresh them
+          # from the latest upstream branch so an old pinned commit still builds.
+          LATEST_PROFILE_REF="origin/master"
+          if ! git -C "$SOURCE_DIR" rev-parse --verify "$LATEST_PROFILE_REF" >/dev/null 2>&1; then
+            LATEST_PROFILE_REF="origin/main"
+          fi
+          for profile in Telegram Intents NotificationContent NotificationService Share WatchApp WatchExtension Widget BroadcastUpload; do
+            git -C "$SOURCE_DIR" show "$LATEST_PROFILE_REF:build-system/fake-codesigning/profiles/${profile}.mobileprovision" \
+              > "$SOURCE_DIR/build-system/fake-codesigning/profiles/${profile}.mobileprovision"
+          done
+
+          # dSYM generation used to be stripped out here to save build time, on
+          # the reasoning that an unsigned sideload build has no use for symbol
+          # archives. That was wrong, and it is why three crash reports in a row
+          # could only be read as raw offsets: upstream also builds with
+          # --objc_enable_binary_stripping, so the shipped framework carries no
+          # function names at all. Without the dSYM there is nothing left to
+          # symbolicate against. Keep it -- a symbol archive is the difference
+          # between guessing which function died and knowing.
+          #
+          # And the second half of the same problem: --objc_enable_binary_stripping
+          # itself. The crash in #17 is
+          #
+          #   method_t::getMethodFromListArray  <- fault, unmapped memory
+          #   lookUpImpOrForward
+          #   class_getMethodImplementation
+          #   CA::Layer::class_state(objc_class*)
+          #   -[CALayer init]
+          #   Display.SimpleLayer.__allocating_init
+          #
+          # i.e. the ObjC runtime walking a method list of a Swift class that
+          # subclasses CALayer, and reading a pointer that is not valid. That flag
+          # exists for one purpose -- to rewrite and drop ObjC metadata at link
+          # time -- which makes it the prime suspect for metadata the runtime
+          # cannot read. It only makes the binary smaller, so for a sideload build
+          # the trade is not worth taking. `dead_strip` stays: it removes
+          # unreachable code, not metadata.
+          python3 - <<'PY'
+          import pathlib
+          import re
+
+          make_path = pathlib.Path("build-system/Make/Make.py")
+          text = make_path.read_text()
+          for marker in ("'--apple_generate_dsym',", "'--output_groups=+dsyms',"):
+              print(f"dSYM flag present in Make.py: {marker} -> {marker in text}")
+
+          # Match the whole line, whatever it is indented with, so this keeps
+          # working if upstream reformats the list.
+          pattern = re.compile(r"^[ \t]*'--objc_enable_binary_stripping',[ \t]*\r?\n", re.M)
+          found = pattern.findall(text)
+          if len(found) != 1:
+              # Fail loudly. A silent no-op here would produce a build that looks
+              # exactly like "the fix did not help", which is the worst outcome:
+              # it would send us hunting for a different cause.
+              raise SystemExit(
+                  "objc stripping: expected exactly one flag line in Make.py, found %d" % len(found))
+          make_path.write_text(pattern.sub("", text))
+          print("objc stripping disabled: removed '--objc_enable_binary_stripping' from Make.py")
+          print("mentions left in Make.py: %d"
+                % make_path.read_text().count("--objc_enable_binary_stripping"))
+          PY
+
+          python3 "$SOURCE_DIR/build-system/Make/ImportCertificates.py" --path "$SOURCE_DIR/build-system/fake-codesigning/certs"
+
+          python3 -u "$SOURCE_DIR/build-system/Make/Make.py" \
+            --bazelUserRoot="$BAZEL_USER_ROOT" \
+            --overrideXcodeVersion \
+            --cacheDir="$BAZEL_CACHE_DIR" \
+            build \
+            --configurationPath="$SOURCE_DIR/build-system/appstore-configuration.json" \
+            --codesigningInformationPath="$SOURCE_DIR/build-system/fake-codesigning" \
+            --configuration=release_arm64 \
+            --outputBuildArtifactsPath="$SOURCE_DIR/build/artifacts" \
+            --buildNumber="$BUILD_NUMBER"
+
+      - name: Collect artifacts
+        run: |
+          set -euxo pipefail
+          SOURCE_DIR="$RUNNER_TEMP/telegram-ios"
+          OUTPUT_DIR="$RUNNER_TEMP/artifacts"
+          ARTIFACTS_DIR="$SOURCE_DIR/build/artifacts"
+          WORK_DIR="$RUNNER_TEMP/shapitogram-ipa-work"
+          mkdir -p "$OUTPUT_DIR"
+
+          # The IPA name follows the app name in the configuration used above, but
+          # Make.py versions differ on where they drop it -- look for any IPA
+          # rather than betting on one path.
+          IPA_PATH=""
+          for candidate in "$ARTIFACTS_DIR/Telegram.ipa" "$ARTIFACTS_DIR"/*.ipa; do
+            if [[ -f "$candidate" ]]; then
+              IPA_PATH="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$IPA_PATH" ]]; then
+            echo "No IPA produced. Searching the source tree..." >&2
+            IPA_PATH="$(find "$SOURCE_DIR/build" -name '*.ipa' -type f -print -quit 2>/dev/null || true)"
+          fi
+          if [[ -z "$IPA_PATH" ]]; then
+            echo "No IPA found anywhere under $SOURCE_DIR/build" >&2
+            ls -la "$SOURCE_DIR/build" 2>/dev/null || true
+            exit 1
+          fi
+          echo "Using IPA: $IPA_PATH"
+
+          rm -rf "$WORK_DIR"
+          mkdir -p "$WORK_DIR"
+          ditto -x -k "$IPA_PATH" "$WORK_DIR"
+
+          export WORK_DIR
+          python3 - <<'PY'
+          import os
+          import plistlib
+          from pathlib import Path
+
+          work_dir = Path(os.environ["WORK_DIR"])
+          app_name = os.environ["CUSTOM_APP_NAME"]
+          old_bundle = "ph.telegra.Telegraph"
+          new_bundle = os.environ["CUSTOM_BUNDLE_ID"]
+          new_scheme = os.environ["CUSTOM_URL_SCHEME"]
+
+          # Put the build number where a human can actually see it. iOS shows
+          # CFBundleDisplayName in Settings, but for the version it only ever
+          # shows CFBundleShortVersionString -- so every build of ours reported
+          # "12.9.2" and there was no way to tell an old install from a new one
+          # before the app was running. That ambiguity cost two rounds of
+          # "did the new build actually get installed?".
+          build_number = os.environ.get("BUILD_NUMBER", "").strip()
+          display_name = ("%s %s" % (app_name, build_number)).strip() if build_number else app_name
+
+          def transform(value):
+              if isinstance(value, str):
+                  return value.replace(old_bundle, new_bundle)
+              if isinstance(value, list):
+                  return [transform(v) for v in value]
+              if isinstance(value, dict):
+                  return {k: transform(v) for k, v in value.items()}
+              return value
+
+          payload_dir = work_dir / "Payload"
+          app_dirs = list(payload_dir.glob("*.app"))
+          if len(app_dirs) != 1:
+              raise SystemExit(f"Expected exactly one .app in Payload, found: {app_dirs}")
+
+          app_dir = app_dirs[0]
+          plist_files = [app_dir / "Info.plist"]
+          plist_files.extend(app_dir.glob("PlugIns/*.appex/Info.plist"))
+          plist_files.extend(app_dir.glob("Frameworks/*.framework/Info.plist"))
+
+          for plist_path in plist_files:
+              if not plist_path.exists():
+                  continue
+              with plist_path.open("rb") as f:
+                  data = plistlib.load(f)
+
+              data = transform(data)
+
+              if plist_path == app_dir / "Info.plist":
+                  data["CFBundleDisplayName"] = display_name
+                  data["CFBundleName"] = display_name
+                  url_types = data.get("CFBundleURLTypes")
+                  if isinstance(url_types, list):
+                      for entry in url_types:
+                          if not isinstance(entry, dict):
+                              continue
+                          schemes = entry.get("CFBundleURLSchemes")
+                          if isinstance(schemes, list):
+                              entry["CFBundleURLSchemes"] = [
+                                  new_scheme if s in ("telegram", "tg", "tonsite") else s for s in schemes
+                              ]
+
+              with plist_path.open("wb") as f:
+                  plistlib.dump(data, f, sort_keys=False)
+
+          PY
+
+          bash "$GITHUB_WORKSPACE/scripts/slim_ipa.sh" "$WORK_DIR"
+
+          # Strip every signature artefact so the archive is honestly unsigned and
+          # Sideloadly/AltStore can re-sign it with the installer's own Apple ID.
+          find "$WORK_DIR/Payload" -type d -name "_CodeSignature" -prune -exec rm -rf {} +
+          find "$WORK_DIR/Payload" -type f -name "embedded.mobileprovision" -delete
+
+          rm -f "$OUTPUT_DIR/ShapitoGram-unsigned.ipa"
+          (
+            cd "$WORK_DIR"
+            /usr/bin/zip -q -r -y -9 "$OUTPUT_DIR/ShapitoGram-unsigned.ipa" Payload
+          )
+
+          # Make.py writes the symbol archive next to the IPA. Best effort: a
+          # missing dSYM must not fail the run, because the IPA itself is still
+          # a valid deliverable -- it just cannot be symbolicated afterwards.
+          if [[ -f "$ARTIFACTS_DIR/Telegram.DSYMs.zip" ]]; then
+            cp "$ARTIFACTS_DIR/Telegram.DSYMs.zip" "$OUTPUT_DIR/Telegram.DSYMs.zip"
+            echo "dSYM archive collected: $(du -h "$OUTPUT_DIR/Telegram.DSYMs.zip" | cut -f1)"
+          else
+            echo "note: no dSYM archive produced; crash logs will be unreadable" >&2
+            find "$SOURCE_DIR/build" -name '*.dSYM' -maxdepth 4 2>/dev/null || true
+          fi
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShapitoGram-unsigned-ipa-${{ env.BUILD_NUMBER }}
+          path: ${{ runner.temp }}/artifacts
+          if-no-files-found: error
