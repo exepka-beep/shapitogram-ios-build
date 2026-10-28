@@ -81,3 +81,10 @@ python3 "$SCRIPT_DIR/apply_clouddata_guard.py" "$SOURCE_DIR"
 # because the process has no com.apple.developer.siri entitlement. Not a brk
 # this time -- an uncaught exception, so SIGABRT. Siri is off for good.
 python3 "$SCRIPT_DIR/apply_siri_guard.py" "$SOURCE_DIR"
+
+# ShapitoGram's own +1337 numbering plan. 1337 is not a calling code but starts
+# with "1", so the client resolves it to the USA: the login screen rewrites the
+# typed "1" into "+1" (1337 cannot be entered at all) and the profile prints
+# "+1 (337) 123-3". The server lists the range as country ZZ, but this makes the
+# client work regardless of whether that list has loaded.
+python3 "$SCRIPT_DIR/apply_shapitogram_phone.py" "$SOURCE_DIR"
